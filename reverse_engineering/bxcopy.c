@@ -138,7 +138,15 @@ typedef struct {
 	#error "ERROR: unknow operating system"
 #endif
 
+#define NUM_ELF_HEADERS 10
 #define PAGE_MASK (~(PAGE_SIZE - 1))
+
+// usefull macros functions
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#define LO_PAGE_ADDR(phdr) ((phdr)->p_offset & PAGE_MASK)
+#define HI_PAGE_ADDR(phdr) (((phdr)->p_offset + ((phdr)->p_filesz) + PAGE_SIZE - 1) & PAGE_MASK)
+
+#define INTERSECTS(off1, size1, off2, size2) ( ((off1) < (off2)) ? ((off2) < (off1) + (size1)) : ((off1) < ((off2) + (size2))) )
 
 /* ============================= BODY ============================= */
 
@@ -175,6 +183,107 @@ static int	read_text_segment(pid_t pid, unsigned addr, char *buf, size_t num_byt
 	return 1;
 }
 
+/* ------------------------   functions   ----------------------- */
+
+/*
+ * Prints warning message for the bytes in the file that couldn't be recovered.
+ * Uses 0/0 for offset/size to signal end of all lost data.
+ */
+static void	warn_lost_data (pid_t pid, Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, unsigned int offset, unsigned int size) {
+
+	// to do
+	(void)pid;
+	(void)ehdr;
+	(void)phdr;
+	(void)offset;
+	(void)size;
+}
+
+static unsigned	*map_memory_pages(pid_t pid, Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, size_t file_size) {
+
+	int			num_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+	unsigned	*pages = calloc(num_pages, sizeof(unsigned));
+	Elf32_Phdr	*this_phdr = NULL;
+
+	/* map memory pages to position in file */
+	for (int i = 0; i < num_pages; i++) {
+
+		for (int p = 0; p < ehdr->e_phnum; p++) {
+
+			this_phdr = &phdr[p];
+			if (this_phdr->p_type == PT_LOAD) {
+
+				// check if this memory page match with this programm segment
+				if (LO_PAGE_ADDR(this_phdr) <= (i * PAGE_SIZE) && ((i + 1) * PAGE_SIZE) <= HI_PAGE_ADDR(this_phdr)) {
+
+					/* check for lost data in the last page of the segment */
+					end_segment_address = this_phdr->p_offset + this_phdr->p_filesz;
+					bool last_page = end_segment_address < ((i + 1) * PAGE_SIZE);
+					if (last_page && (this_phdr->p_memsz > this_phdr->p_filesz))
+						warn_lost_data(pid, ehdr, phdr, end_segment_address, ((i + 1) * PAGE_SIZE) - end_segment_address);
+					
+					// calculate memory address of the page
+					pages[i] = phdr[p].p_vaddr - phdr[p].p_offset + (i * PAGE_SIZE);
+					break;
+				}
+			}
+		}
+
+		/* warn about lost data if no memory page maps to file */
+		if (!pages[i])
+			warn_lost_data(pid, ehdr, phdr, i * PAGE_SIZE, PAGE_SIZE);
+	}
+	/* signal that an attempt to recover all pages has been made */
+	warn_lost_data(pid, ehdr, phdr, 0, 0);
+}
+
+// Writes the memory pages to the given filename.  Requires that ehdr and phdr are in loaded memory.
+static bool	create_file(char *filename, pid_t pid, Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, size_t file_size) {
+
+	unsigned	*pages = map_memory_pages(pid, ehdr, phdr, file_size);
+	if (!pages) {
+		perror("malloc");
+		return false;
+	}
+
+	free(pages);
+	return true;
+}
+
+static bool	save_to_file(char *filename, pid_t pid, unsigned int addr, size_t file_size) {
+
+	bool			ret = false;
+	char		page[PAGE_SIZE] = { 0 };
+	Elf32_Ehdr	*ehdr; /* file header */
+	Elf32_Phdr	*phdr; /* segment header */
+
+	if (read_text_segment(pid, addr, page, PAGE_SIZE)) {
+		/* ensure 32bit elf binary */
+		ehdr = (Elf32_Ehdr *)page;
+		if (page[EI_CLASS] == ELFCLASS32 && ehdr->e_type == ET_EXEC) {
+
+			/* ensure program header table is in same page as elf header */
+			if ((ehdr->e_phoff + ehdr->e_phnum * ehdr->e_phentsize) < PAGE_SIZE) {
+				phdr = (Elf32_Phdr *) (page + ehdr->e_phoff);
+				ret = create_file(filename, pid, ehdr, phdr, file_size);
+			}
+			else
+				fprintf(stderr, "program header table could not be found\n");
+		}
+		else
+			fprintf(stderr, "no 32bit elf executable, found at addr 0x%08x\n", addr);
+	}
+	return ret;
+}
+
+// Searches memory for an elf header.
+static unsigned	find_elf_header(pid_t pid) {
+
+	// to do
+	(void)pid;
+	return 0;
+}
+
 /* ------------------------   initiation   ----------------------- */
 
 bool	ui_arg(int ac, char *av[], char **filename, unsigned *addr) {
@@ -202,7 +311,7 @@ bool	ui_arg(int ac, char *av[], char **filename, unsigned *addr) {
 
 void	child_proc(char *filename) {
 
-	char	buff_error[BUFF_SIZE];
+	char	buff_error[BUFF_SIZE] = { 0 };
 
 	/* it attaches the current process (the process executing this code) to a debugger */
 	if (!ptrace(PTRACE_TRACEME, 0, 0, 0)) {
@@ -218,34 +327,30 @@ void	child_proc(char *filename) {
 
 int	parent_proc(char *filename, unsigned addr, size_t file_size, pid_t pid) {
 
-	int ret_val = 1;
+	int 	ret_val = 1, status = 0;
+	char	out_filename[BUFF_SIZE] = { 0 };
+
 	if (waitpid(pid, &status, WUNTRACED) == pid) {
 
 		if (!WIFEXITED(status)) {
 		/* SIGTRAP is delivered to child after execve */
 		if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
 
-	/* ==============   to do   ============== */
-            if (addr == 0)
-               addr = find_elf_header(pid);
-            if (addr != 0) {
-               snprintf(out_filename, sizeof(out_filename), "%s.out",
-                        basename(filename));
+			if (!addr)
+				addr = find_elf_header(pid); // to do
+			if (addr) {
+				snprintf(out_filename, sizeof(out_filename), "%s.out", basename(filename));
 
-               if (save_to_file(out_filename, pid, addr, file_size)) {
-                  chmod(out_filename, 00755);
-                  fprintf(stdout, "created file `%s'\n", out_filename);
-                  ret_val = EXIT_SUCCESS;
-               }
-            }
-            else {
-               fprintf(stderr, "couldn't find elf header in memory\n");
-            }
-         }
-         else {
-            fprintf(stderr, "didn't receive SIGTRAP after execve\n");
-         }
-	/* ======================================= */
+				if (save_to_file(out_filename, pid, addr, file_size)) {
+					chmod(out_filename, 00755);
+					ret_val = 0;
+				}
+			}
+			else
+				fprintf(stderr, "couldn't find elf header in memory\n");
+		}
+		else
+			fprintf(stderr, "didn't receive SIGTRAP after execve\n");
 
 		/* kill child as we are finished */
 		ptrace(PTRACE_KILL, pid, 0, 0);
@@ -270,7 +375,7 @@ int	main(int ac, char *av[]) {
 			"where addr is the memory address of the ELF header\n", av[0]);
 		return 1;
 	}
-	bzero(stat_buf, sizeof(stat_buf));
+	bzero(&stat_buf, sizeof(stat_buf));
 	if (stat(filename, &stat_buf)) {
 
 		snprintf(buff_error, sizeof(buff_error), "couldn't stat file `%s`", filename);
