@@ -3,6 +3,7 @@
 // Author: Noah BEAUFILS
 // Date: 14-oct-2023
 // From: [Copyright (C) 2002, 2003 Dion Mendel.]
+// Functs: 12
 
 /* Note:	Does not work for suid apps under linux 2.2.x.
 			Does not work on linux kernels between 2.4.21-pre6 .. 2.4.21-rc2
@@ -148,9 +149,9 @@ typedef struct {
 
 #define INTERSECTS(off1, size1, off2, size2) ( ((off1) < (off2)) ? ((off2) < (off1) + (size1)) : ((off1) < ((off2) + (size2))) )
 
-/* ============================= BODY ============================= */
+/* ============================== BODY ============================= */
 
-/* -----------------------   utils (libC)   ---------------------- */
+/* ------------------------   utils (libC)   ----------------------- */
 
 static int	tolower(int c) { return (('A' <= c && c <= 'Z') ? (c + 32) : c); }
 
@@ -185,69 +186,111 @@ static int	read_text_segment(pid_t pid, unsigned addr, char *buf, size_t num_byt
 
 /* ------------------------   functions   ----------------------- */
 
-/*
- * Prints warning message for the bytes in the file that couldn't be recovered.
- * Uses 0/0 for offset/size to signal end of all lost data.
- */
-static void	warn_lost_data (pid_t pid, Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, unsigned int offset, unsigned int size) {
+// Prints warning message for the bytes in the file that couldn't be recovered.
+// Uses 0/0 for offset/size to signal end of all lost data.
+static void	warn_lost_data (Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, unsigned int offset, unsigned int size) {
 
-	// to do
-	(void)pid;
-	(void)ehdr;
-	(void)phdr;
-	(void)offset;
-	(void)size;
+	static unsigned int	last_offset;	/* for recording last offset */
+	static unsigned int	last_size;		/* and size - initialised to zero */
+
+	if ((offset && size) && last_offset + last_size == offset) {
+		last_size += size;
+		return ;
+	}
+
+	if (last_offset != 0 && last_size != 0) {
+		fprintf(stderr, "could not recover data - %d bytes at file offset %d\n", last_size, last_offset);
+
+		for (int i = 0; i < ehdr->e_phnum; i++) {
+			if (phdr[i].p_type != PT_NULL) {
+				if (INTERSECTS(last_offset, last_size, phdr[i].p_offset, phdr[i].p_filesz))
+					fprintf(stderr, " ! data from phdr[%d] was not recovered\n", i);
+			}
+		}
+
+		if ((ehdr->e_shnum != 0) && INTERSECTS(last_offset, last_size, \
+			ehdr->e_shoff, ehdr->e_shnum * ehdr->e_shentsize))
+			fprintf(stderr, " ! section header table was not recovered\n");
+	}
+
+	/* record this offset and size */
+	last_offset = offset;
+	last_size = size;
 }
 
-static unsigned	*map_memory_pages(pid_t pid, Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, size_t file_size) {
+// map memory pages to position in file
+static unsigned	*map_memory_pages(Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, size_t file_size) {
 
+	Elf32_Phdr	*this_phdr = NULL;
 	int			num_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
 	unsigned	*pages = calloc(num_pages, sizeof(unsigned));
-	Elf32_Phdr	*this_phdr = NULL;
+	if (!pages)
+		return NULL;
 
-	/* map memory pages to position in file */
 	for (int i = 0; i < num_pages; i++) {
-
 		for (int p = 0; p < ehdr->e_phnum; p++) {
 
 			this_phdr = &phdr[p];
 			if (this_phdr->p_type == PT_LOAD) {
-
 				// check if this memory page match with this programm segment
 				if (LO_PAGE_ADDR(this_phdr) <= (i * PAGE_SIZE) && ((i + 1) * PAGE_SIZE) <= HI_PAGE_ADDR(this_phdr)) {
 
 					/* check for lost data in the last page of the segment */
-					end_segment_address = this_phdr->p_offset + this_phdr->p_filesz;
+					unsigned	end_segment_address = this_phdr->p_offset + this_phdr->p_filesz;
 					bool last_page = end_segment_address < ((i + 1) * PAGE_SIZE);
+
 					if (last_page && (this_phdr->p_memsz > this_phdr->p_filesz))
-						warn_lost_data(pid, ehdr, phdr, end_segment_address, ((i + 1) * PAGE_SIZE) - end_segment_address);
-					
+						warn_lost_data(ehdr, phdr, end_segment_address, ((i + 1) * PAGE_SIZE) - end_segment_address);
 					// calculate memory address of the page
 					pages[i] = phdr[p].p_vaddr - phdr[p].p_offset + (i * PAGE_SIZE);
 					break;
 				}
 			}
 		}
-
 		/* warn about lost data if no memory page maps to file */
 		if (!pages[i])
-			warn_lost_data(pid, ehdr, phdr, i * PAGE_SIZE, PAGE_SIZE);
+			warn_lost_data(ehdr, phdr, i * PAGE_SIZE, PAGE_SIZE);
 	}
 	/* signal that an attempt to recover all pages has been made */
-	warn_lost_data(pid, ehdr, phdr, 0, 0);
+	warn_lost_data(ehdr, phdr, 0, 0);
+	return pages;
 }
 
-// Writes the memory pages to the given filename.  Requires that ehdr and phdr are in loaded memory.
+// Writes the memory pages to the given filename
 static bool	create_file(char *filename, pid_t pid, Elf32_Ehdr *ehdr, Elf32_Phdr *phdr, size_t file_size) {
 
-	unsigned	*pages = map_memory_pages(pid, ehdr, phdr, file_size);
+	bool		ret = false;
+	FILE		*fptr = NULL;
+	char		page[PAGE_SIZE];
+	int			num_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+	unsigned	*pages = map_memory_pages(ehdr, phdr, file_size);
+
 	if (!pages) {
 		perror("malloc");
 		return false;
 	}
-
+	/* write memory pages to file */
+	if ((fptr = fopen(filename, "wb"))) { // open a file in binary mode for writting
+		for (int i = 0; i < num_pages; i++) {
+			if (pages[i]) {
+				if (!read_text_segment(pid, pages[i], page, PAGE_SIZE)) {
+					fclose(fptr);
+					free(pages);
+					return false;
+				}
+			}
+			else
+				memset(page, '\0', PAGE_SIZE);
+			fwrite(page, 1, MIN(file_size, PAGE_SIZE), fptr);
+			file_size -= PAGE_SIZE;
+		}
+		fclose(fptr);
+		ret = true;
+	}
+	else
+		perror(filename);
 	free(pages);
-	return true;
+	return ret;
 }
 
 static bool	save_to_file(char *filename, pid_t pid, unsigned int addr, size_t file_size) {
@@ -276,17 +319,57 @@ static bool	save_to_file(char *filename, pid_t pid, unsigned int addr, size_t fi
 	return ret;
 }
 
-// Searches memory for an elf header.
+// Searches memory for an elf header
 static unsigned	find_elf_header(pid_t pid) {
 
-	// to do
-	(void)pid;
-	return 0;
+	Elf32_Ehdr	hdr;
+	PTRACE_WORD	word = 0;
+	int			num_possible = 0;
+	char		*elf_hdr = "\177ELF";
+	unsigned	possible[NUM_ELF_HEADERS] = { 0 };
+
+	/* search each page to see if elf header is found */
+	for (unsigned addr = LO_USER; addr < HI_USER; addr += PAGE_SIZE) {
+		bool	found_elf_header = false;
+
+		word = ptrace(PTRACE_PEEKTEXT, pid, addr, 0);
+		if ((errno == 0) && (word == *((PTRACE_WORD *)elf_hdr))) {
+			if (read_text_segment(pid, addr, (char *)&hdr, sizeof(hdr))) {
+				if (hdr.e_type == ET_EXEC)
+					found_elf_header = true;
+				else if (hdr.e_type == ET_DYN)
+					fprintf(stderr, "discarding shared library at virtual memory address 0x%08x\n", addr);
+			}
+		}
+		if (found_elf_header) {
+			if (num_possible == NUM_ELF_HEADERS) {
+				fprintf(stderr, "too many possible elf headers found (> %d)\n", NUM_ELF_HEADERS);
+				return 0;
+			}
+			possible[num_possible] = addr;
+			num_possible++;
+		}
+	}
+
+	if (!num_possible)
+		return 0; /* no elf header found */
+	else if (num_possible == 1) {
+		/* a single elf header was found */
+		fprintf(stdout, "using elf header at virtual memory address 0x%08x\n", possible[0]);
+		return possible[0];
+	}
+	else {
+		/* need to resolve conflicts - let user decide */
+		fprintf(stderr, "multiple elf headers found:\n");
+		for (int i = 0; i < num_possible; i++)
+			printf("  0x%08x\n", possible[i]);
+		return 0;
+	}
 }
 
 /* ------------------------   initiation   ----------------------- */
 
-bool	ui_arg(int ac, char *av[], char **filename, unsigned *addr) {
+static bool	ui_arg(int ac, char *av[], char **filename, unsigned *addr) {
 
 	if (ac == 2) {
 		*filename = av[1];
@@ -370,7 +453,7 @@ int	main(int ac, char *av[]) {
 	unsigned	addr = 0;
 	struct stat	stat_buf;
 
-	if (ui_arg(ac, av, &filename, &addr)) {
+	if (!ui_arg(ac, av, &filename, &addr)) {
 		fprintf(stderr, "Usage: %s [-a addr] <file>\n" \
 			"where addr is the memory address of the ELF header\n", av[0]);
 		return 1;
